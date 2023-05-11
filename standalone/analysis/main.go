@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/docker/go-units"
 	com "github.com/sqlitebrowser/dbhub.io/common"
@@ -111,8 +112,9 @@ func main() {
 	}
 
 	// Store the information in our PostgreSQL backend
+	now := time.Now()
 	for user, z := range userStorage {
-		err = com.AnalysisRecordUserStorage(user, z.Standard, z.Live)
+		err = com.AnalysisRecordUserStorage(user, now, z.Standard, z.Live)
 		if err != nil {
 			log.Fatalln()
 		}
