@@ -5,8 +5,8 @@ package main
 // run from cron on a periodic basis (ie every few hours)
 
 import (
-	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/docker/go-units"
@@ -15,6 +15,10 @@ import (
 
 var (
 	Debug = false
+
+	// Historical controls whether to calculate historical space usage as well, or just
+	// all usage for the current date
+	Historical = false
 )
 
 func main() {
@@ -22,6 +26,12 @@ func main() {
 	err := com.ReadConfig()
 	if err != nil {
 		log.Fatalf("Configuration file problem: '%s'", err)
+	}
+
+	// Check if we should operate in Historical mode for this run
+	if len(os.Args) > 1 && os.Args[1] == "--hist" {
+		Historical = true
+		log.Println("Historical mode enabled")
 	}
 
 	// Connect to PostgreSQL server
@@ -44,7 +54,7 @@ func main() {
 	}
 
 	type dbSizes struct {
-		Live int64
+		Live     int64
 		Standard int64
 	}
 	userStorage := make(map[string]dbSizes)
@@ -52,7 +62,7 @@ func main() {
 	// Loop through the users, calculating the total disk space used by each
 	for user, numDBs := range userList {
 		if Debug {
-			fmt.Printf("User: %s, # databases: %d\n", user, numDBs)
+			log.Printf("User: %s, # databases: %d", user, numDBs)
 		}
 
 		// Get the list of standard databases for a user
@@ -64,12 +74,13 @@ func main() {
 		// For each standard database, count the list of commits and amount of space used
 		var spaceUsedStandard int64
 		for _, db := range dbList {
+			// Get the commit list for the database
 			commitList, err := com.GetCommitList(user, db.Database)
 			if err != nil {
 				log.Println(err)
 			}
 
-			// Calculate space used by standard databases
+			// Calculate space used by standard databases across all time
 			for _, commit := range commitList {
 				tree := commit.Tree.Entries
 				for _, j := range tree {
@@ -78,7 +89,7 @@ func main() {
 			}
 
 			if Debug {
-				fmt.Printf("User: %s, Standard database: %s, # Commits: %d, Space used: %s\n", user, db.Database, len(commitList), units.HumanSize(float64(spaceUsedStandard)))
+				log.Printf("User: %s, Standard database: %s, # Commits: %d, Space used: %s", user, db.Database, len(commitList), units.HumanSize(float64(spaceUsedStandard)))
 			}
 		}
 
@@ -105,7 +116,7 @@ func main() {
 			spaceUsedLive += z
 
 			if Debug {
-				fmt.Printf("User: %s, Live database: %s, Space used: %s\n", user, db.Database, units.HumanSize(float64(spaceUsedLive)))
+				log.Printf("User: %s, Live database: %s, Space used: %s", user, db.Database, units.HumanSize(float64(spaceUsedLive)))
 			}
 		}
 		userStorage[user] = dbSizes{Standard: spaceUsedStandard, Live: spaceUsedLive}
@@ -120,5 +131,86 @@ func main() {
 		}
 	}
 
+	// Do the historical storage analysis if requested by the caller
+	if Historical {
+		for user, _ := range userList {
+			// Get the date the user signed up
+			details, err := com.User(user)
+			if err != nil {
+				log.Fatal(err)
+			}
+			joinDate := details.DateJoined
+
+			if Debug {
+				log.Printf("User: '%s', Joined on: %s", user, joinDate.Format(time.RFC1123))
+			}
+
+			// Get the list of standard databases for a user
+			dbList, err := com.UserDBs(user, com.DB_BOTH)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			type commitList map[string]com.CommitEntry
+			dbCommits := make(map[string]commitList)
+
+			// Loop through the days, calculating the space used each day since they joined until today
+			pointInTime := joinDate
+			for pointInTime.Before(now) {
+				// Calculate the disk space used by all of the users' databases for the given day
+				var spaceUsed int64
+				for _, db := range dbList {
+					// Get the commit list for the database, using a cache to reduce multiple database hits for the same info
+					commits, ok := dbCommits[db.Database]
+					if !ok {
+						commits, err = com.GetCommitList(user, db.Database)
+						if err != nil {
+							log.Println(err)
+						}
+						dbCommits[db.Database] = commits
+					}
+
+					// Calculate the disk space used by this one database
+					z, err := SpaceUsedBetweenDates(user, db.Database, commits, joinDate, pointInTime)
+					if err != nil {
+						log.Fatal(err)
+					}
+					spaceUsed += z
+				}
+
+				// Record the storage space used by the database (until this date) to our backend
+				err = com.AnalysisRecordUserStorage(user, pointInTime, spaceUsed, 0)
+				if err != nil {
+					log.Fatalln()
+				}
+
+				// Move the point in time forward by a day
+				pointInTime = pointInTime.Add(time.Hour * 24)
+			}
+		}
+	}
+
 	log.Printf("%s run complete", com.Conf.Live.Nodename)
+}
+
+// SpaceUsedBetweenDates determines the storage space used by a standard database between two different dates
+func SpaceUsedBetweenDates(userName, dbName string, commitList map[string]com.CommitEntry, startDate, endDate time.Time) (spaceUsed int64, err error) {
+	// Check every commit in the database, adding the ones between the start and end dates to the usage total
+	var relevantCommits int
+	for _, commit := range commitList {
+		if commit.Timestamp.After(startDate) && commit.Timestamp.Before(endDate) {
+			// This commit is in the requested time range
+			relevantCommits++
+			tree := commit.Tree.Entries
+			for _, j := range tree {
+				spaceUsed += j.Size
+			}
+		}
+	}
+
+	if Debug {
+		log.Printf("User: %s, Standard database: %s, Date: %s, # Commits: %d, Space used: %s", userName, dbName,
+			endDate.Format(time.RFC850), relevantCommits, units.HumanSize(float64(spaceUsed)))
+	}
+	return
 }

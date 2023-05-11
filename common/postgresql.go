@@ -112,8 +112,8 @@ func AnalysisRecordUserStorage(userName string, recordDate time.Time, spaceUsedS
 			WHERE lower(user_name) = lower($1)
 		)
 		INSERT INTO analysis_space_used (user_id, analysis_date, standard_databases_bytes, live_databases_bytes)
-		VALUES ((SELECT user_id FROM u), $2, $3)`
-	commandTag, err := pdb.Exec(context.Background(), dbQuery, recordDate, userName, spaceUsedStandard, spaceUsedLive)
+		VALUES ((SELECT user_id FROM u), $2, $3, $4)`
+	commandTag, err := pdb.Exec(context.Background(), dbQuery, userName, recordDate, spaceUsedStandard, spaceUsedLive)
 	if err != nil {
 		log.Printf("Adding record of storage space used by '%s' failed: %s", userName, err)
 		return
