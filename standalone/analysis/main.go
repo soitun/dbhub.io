@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	Debug = false
+	Debug = true
 
 	// Historical controls whether to calculate historical space usage for each day, or just usage for the current date
 	Historical = false
@@ -52,6 +52,10 @@ func main() {
 		log.Fatalln(err)
 	}
 
+	if Debug {
+		log.Printf("# of users: %d", len(userList))
+	}
+
 	type dbSizes struct {
 		Live     int64
 		Standard int64
@@ -63,7 +67,7 @@ func main() {
 	if !Historical {
 		for user, numDBs := range userList {
 			if Debug {
-				log.Printf("User: %s, # databases: %d", user, numDBs)
+				log.Printf("Processing user: %s, # databases: %d", user, numDBs)
 			}
 
 			// Get the list of standard databases for a user
@@ -143,7 +147,7 @@ func main() {
 			joinDate := details.DateJoined
 
 			if Debug {
-				log.Printf("User: '%s', Joined on: %s", user, joinDate.Format(time.RFC1123))
+				log.Printf("Processing user: '%s', Joined on: %s", user, joinDate.Format(time.RFC1123))
 			}
 
 			// Get the list of standard databases for a user
@@ -177,11 +181,6 @@ func main() {
 						log.Fatal(err)
 					}
 					spaceUsed += z
-				}
-
-				if Debug {
-					log.Printf("User: %s, Date: %s, Space used: %s", user, pointInTime.Format(time.RFC850),
-						units.HumanSize(float64(spaceUsed)))
 				}
 
 				// Record the storage space used by the database (until this date) to our backend
