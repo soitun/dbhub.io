@@ -16,8 +16,7 @@ import (
 var (
 	Debug = false
 
-	// Historical controls whether to calculate historical space usage as well, or just
-	// all usage for the current date
+	// Historical controls whether to calculate historical space usage for each day, or just usage for the current date
 	Historical = false
 )
 
@@ -60,74 +59,76 @@ func main() {
 	userStorage := make(map[string]dbSizes)
 
 	// Loop through the users, calculating the total disk space used by each
-	for user, numDBs := range userList {
-		if Debug {
-			log.Printf("User: %s, # databases: %d", user, numDBs)
-		}
-
-		// Get the list of standard databases for a user
-		dbList, err := com.UserDBs(user, com.DB_BOTH)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// For each standard database, count the list of commits and amount of space used
-		var spaceUsedStandard int64
-		for _, db := range dbList {
-			// Get the commit list for the database
-			commitList, err := com.GetCommitList(user, db.Database)
-			if err != nil {
-				log.Println(err)
+	now := time.Now()
+	if !Historical {
+		for user, numDBs := range userList {
+			if Debug {
+				log.Printf("User: %s, # databases: %d", user, numDBs)
 			}
 
-			// Calculate space used by standard databases across all time
-			for _, commit := range commitList {
-				tree := commit.Tree.Entries
-				for _, j := range tree {
-					spaceUsedStandard += j.Size
+			// Get the list of standard databases for a user
+			dbList, err := com.UserDBs(user, com.DB_BOTH)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			// For each standard database, count the list of commits and amount of space used
+			var spaceUsedStandard int64
+			for _, db := range dbList {
+				// Get the commit list for the database
+				commitList, err := com.GetCommitList(user, db.Database)
+				if err != nil {
+					log.Println(err)
+				}
+
+				// Calculate space used by standard databases across all time
+				for _, commit := range commitList {
+					tree := commit.Tree.Entries
+					for _, j := range tree {
+						spaceUsedStandard += j.Size
+					}
+				}
+
+				if Debug {
+					log.Printf("User: %s, Standard database: %s, # Commits: %d, Space used: %s", user, db.Database, len(commitList), units.HumanSize(float64(spaceUsedStandard)))
 				}
 			}
 
-			if Debug {
-				log.Printf("User: %s, Standard database: %s, # Commits: %d, Space used: %s", user, db.Database, len(commitList), units.HumanSize(float64(spaceUsedStandard)))
-			}
-		}
-
-		// Get the list of live databases for a user
-		liveList, err := com.LiveUserDBs(user, com.DB_BOTH)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// For each live database, get the amount of space used
-		var spaceUsedLive int64
-		for _, db := range liveList {
-			_, liveNode, err := com.CheckDBLive(user, db.Database)
-			if err != nil {
-				log.Fatal(err)
-				return
-			}
-
-			// Ask our AMQP backend for the database size
-			z, err := com.LiveSize(liveNode, user, user, db.Database)
+			// Get the list of live databases for a user
+			liveList, err := com.LiveUserDBs(user, com.DB_BOTH)
 			if err != nil {
 				log.Fatal(err)
 			}
-			spaceUsedLive += z
 
-			if Debug {
-				log.Printf("User: %s, Live database: %s, Space used: %s", user, db.Database, units.HumanSize(float64(spaceUsedLive)))
+			// For each live database, get the amount of space used
+			var spaceUsedLive int64
+			for _, db := range liveList {
+				_, liveNode, err := com.CheckDBLive(user, db.Database)
+				if err != nil {
+					log.Fatal(err)
+					return
+				}
+
+				// Ask our AMQP backend for the database size
+				z, err := com.LiveSize(liveNode, user, user, db.Database)
+				if err != nil {
+					log.Fatal(err)
+				}
+				spaceUsedLive += z
+
+				if Debug {
+					log.Printf("User: %s, Live database: %s, Space used: %s", user, db.Database, units.HumanSize(float64(spaceUsedLive)))
+				}
 			}
+			userStorage[user] = dbSizes{Standard: spaceUsedStandard, Live: spaceUsedLive}
 		}
-		userStorage[user] = dbSizes{Standard: spaceUsedStandard, Live: spaceUsedLive}
-	}
 
-	// Store the information in our PostgreSQL backend
-	now := time.Now()
-	for user, z := range userStorage {
-		err = com.AnalysisRecordUserStorage(user, now, z.Standard, z.Live)
-		if err != nil {
-			log.Fatalln()
+		// Store the information in our PostgreSQL backend
+		for user, z := range userStorage {
+			err = com.AnalysisRecordUserStorage(user, now, z.Standard, z.Live)
+			if err != nil {
+				log.Fatalln()
+			}
 		}
 	}
 
@@ -171,11 +172,16 @@ func main() {
 					}
 
 					// Calculate the disk space used by this one database
-					z, err := SpaceUsedBetweenDates(user, db.Database, commits, joinDate, pointInTime)
+					z, err := SpaceUsedBetweenDates(commits, joinDate, pointInTime)
 					if err != nil {
 						log.Fatal(err)
 					}
 					spaceUsed += z
+				}
+
+				if Debug {
+					log.Printf("User: %s, Date: %s, Space used: %s", user, pointInTime.Format(time.RFC850),
+						units.HumanSize(float64(spaceUsed)))
 				}
 
 				// Record the storage space used by the database (until this date) to our backend
@@ -194,23 +200,16 @@ func main() {
 }
 
 // SpaceUsedBetweenDates determines the storage space used by a standard database between two different dates
-func SpaceUsedBetweenDates(userName, dbName string, commitList map[string]com.CommitEntry, startDate, endDate time.Time) (spaceUsed int64, err error) {
+func SpaceUsedBetweenDates(commitList map[string]com.CommitEntry, startDate, endDate time.Time) (spaceUsed int64, err error) {
 	// Check every commit in the database, adding the ones between the start and end dates to the usage total
-	var relevantCommits int
 	for _, commit := range commitList {
 		if commit.Timestamp.After(startDate) && commit.Timestamp.Before(endDate) {
 			// This commit is in the requested time range
-			relevantCommits++
 			tree := commit.Tree.Entries
 			for _, j := range tree {
 				spaceUsed += j.Size
 			}
 		}
-	}
-
-	if Debug {
-		log.Printf("User: %s, Standard database: %s, Date: %s, # Commits: %d, Space used: %s", userName, dbName,
-			endDate.Format(time.RFC850), relevantCommits, units.HumanSize(float64(spaceUsed)))
 	}
 	return
 }
